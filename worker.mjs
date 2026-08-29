@@ -49,7 +49,7 @@ let previewRevision = 0;
 let lastActivityAt = Date.now();
 let selfDeleteScheduled = false;
 let staticServer = null;
-const BUILD_ID = 'huesteria-worker-v4-20260829';
+const BUILD_ID = 'huesteria-worker-v5-20260829-backend-fallback';
 
 process.on('uncaughtException', (error) => {
   console.error('[Huesteria startup fatal] uncaughtException', error?.stack || error);
@@ -490,6 +490,10 @@ const backendCandidates = [
   { name:'desktop-gl', args:['--use-gl=desktop','--ignore-gpu-blocklist','--enable-webgl','--disable-software-rasterizer'] }
 ];
 function isSoftwareRenderer(text='') { return /swiftshader|llvmpipe|software raster|softpipe|lavapipe/i.test(String(text)); }
+function isRetryableGpuContextError(error) {
+  const text = `${error?.message || ''}\n${error?.stack || ''}\n${JSON.stringify(error?.meta || {})}`;
+  return /webgl\s*context\s*lost|context\s*lost|gpu\s*process|gpu.*crash|device\s*lost|context.*reset|gl_out_of_memory|out of memory/i.test(text);
+}
 async function probeGpu(page) {
   return await page.evaluate(() => {
     const canvas=document.createElement('canvas'); canvas.width=64; canvas.height=64;
@@ -504,41 +508,81 @@ async function probeGpu(page) {
     };
   });
 }
-async function launchHardwareBrowser(url, viewportWidth, viewportHeight) {
-  const attempts=[];
-  for (const backend of backendCandidates) {
-    let candidate=null;
-    try {
-      candidate = await chromium.launch({
-        executablePath:CHROME_EXECUTABLE,
-        headless:true,
-        args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu-sandbox',`--window-size=${viewportWidth},${viewportHeight}`,...backend.args]
-      });
-      const context = await candidate.newContext({ viewport:{width:viewportWidth,height:viewportHeight}, acceptDownloads:true });
-      const page = await context.newPage();
-      page.setDefaultTimeout(120_000);
-      await page.goto(url,{waitUntil:'domcontentloaded',timeout:120_000});
-      await page.waitForFunction(()=>!!window.__huesteriaExportHooks,null,{timeout:120_000});
-      const probe=await probeGpu(page);
-      let gpuInfo=null;
-      try { const cdp=await candidate.newBrowserCDPSession(); gpuInfo=await cdp.send('SystemInfo.getInfo'); } catch (_) {}
-      const combined=`${probe.vendor} ${probe.renderer} ${JSON.stringify(gpuInfo?.gpu?.devices || [])}`;
-      attempts.push({backend:backend.name,probe,devices:gpuInfo?.gpu?.devices || []});
-      if(probe.webgl2 && !isSoftwareRenderer(combined) && /nvidia|geforce|rtx/i.test(combined)) {
-        browser=candidate;
-        return { browser:candidate, context, page, backend:backend.name, probe, gpuInfo, attempts };
-      }
-      await candidate.close(); candidate=null;
-    } catch(error) {
-      attempts.push({backend:backend.name,error:error?.stack || String(error)});
-      try { await candidate?.close(); } catch (_) {}
-    }
+async function launchHardwareBrowserForBackend(url, viewportWidth, viewportHeight, backend) {
+  let candidate=null;
+  try {
+    candidate = await chromium.launch({
+      executablePath:CHROME_EXECUTABLE,
+      headless:true,
+      args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu-sandbox',`--window-size=${viewportWidth},${viewportHeight}`,...backend.args]
+    });
+    const context = await candidate.newContext({ viewport:{width:viewportWidth,height:viewportHeight}, acceptDownloads:true });
+    const page = await context.newPage();
+    page.setDefaultTimeout(120_000);
+    await page.goto(url,{waitUntil:'domcontentloaded',timeout:120_000});
+    await page.waitForFunction(()=>!!window.__huesteriaExportHooks,null,{timeout:120_000});
+    const probe=await probeGpu(page);
+    let gpuInfo=null;
+    try { const cdp=await candidate.newBrowserCDPSession(); gpuInfo=await cdp.send('SystemInfo.getInfo'); } catch (_) {}
+    const devices=gpuInfo?.gpu?.devices || [];
+    const combined=`${probe.vendor} ${probe.renderer} ${JSON.stringify(devices)}`;
+    if(!probe.webgl2) throw new Error(`${backend.name}: WebGL2 unavailable`);
+    if(isSoftwareRenderer(combined)) throw new Error(`${backend.name}: software renderer rejected · ${combined.slice(0,500)}`);
+    if(!/nvidia|geforce|rtx/i.test(combined)) throw new Error(`${backend.name}: NVIDIA renderer not detected · ${combined.slice(0,500)}`);
+    browser=candidate;
+    return { browser:candidate, context, page, backend:backend.name, probe, gpuInfo, devices };
+  } catch(error) {
+    try { await candidate?.close(); } catch (_) {}
+    if(browser===candidate) browser=null;
+    throw error;
   }
-  const error=new Error('NVIDIA hardware WebGL2를 확보하지 못했습니다.');
-  error.attempts=attempts;
-  throw error;
 }
-
+async function restoreSceneOnPage(page) {
+  await page.evaluate(()=>document.getElementById('shellPresetBtn')?.click());
+  await page.waitForSelector('#sceneProjectLoadZipBtn',{state:'attached',timeout:60_000});
+  await page.evaluate(()=>document.getElementById('sceneProjectLoadZipBtn')?.click());
+  await page.waitForSelector('#sceneProjectLoadInput',{state:'attached',timeout:30_000});
+  await page.locator('#sceneProjectLoadInput').setInputFiles(SCENE_ZIP);
+  await page.waitForFunction(()=>(document.getElementById('sceneProjectStatusLine')?.textContent||'').includes('ZIP 불러오기 완료'),null,{timeout:10*60_000});
+  return await page.locator('#sceneProjectStatusLine').textContent();
+}
+async function runBackendWarmup(page, opts) {
+  await page.evaluate(()=>{ window.__huesteriaCloudLiveProgress = null; });
+  const filename='__huesteria_backend_probe.png';
+  const downloadPromise=page.waitForEvent('download',{timeout:10*60_000});
+  const evalPromise=page.evaluate(async opts => {
+    return await window.__huesteriaExportHooks.capturePathTracePng({
+      longEdge:256,
+      samples:1,
+      bounces:Math.max(1,Math.min(2,Number(opts.bounces)||1)),
+      mode:opts.mode,
+      includeMmdXps:opts.includeMmdXps,
+      ptExpressionEnhance:opts.ptExpressionEnhance,
+      disablePathTraceCropTiles:true,
+      disablePathTraceTiles:true,
+      pathTraceTiles:1,
+      includeCameraFrame:false,
+      executionProfile:'cloud-4090',
+      cloudFrame:opts.frame,
+      filename:opts.filename,
+      onProgress:payload=>{window.__huesteriaCloudLiveProgress=payload;}
+    });
+  },{bounces:opts.bounces,mode:opts.mode,includeMmdXps:opts.includeMmdXps,ptExpressionEnhance:opts.ptExpressionEnhance,frame:opts.frame,filename});
+  const [download,result]=await Promise.all([downloadPromise,evalPromise]);
+  try { await download.delete(); } catch (_) {}
+  const meta=await page.evaluate(()=>window.__huesteriaExportHooks.getLastPathTraceMeta?.()||null);
+  if(meta?.webglContextLost || meta?.partialContextLost) {
+    const error=new Error('backend preflight: WebGL context lost');
+    error.meta=meta;
+    throw error;
+  }
+  if(Math.round(Number(meta?.samplesDone||result?.meta?.samplesDone||0)) < 1) {
+    const error=new Error('backend preflight: no valid path-trace sample');
+    error.meta=meta;
+    throw error;
+  }
+  return { result, meta };
+}
 async function writeLivePreview(page) {
   try {
     const dataUrl = await page.evaluate(() => {
@@ -580,8 +624,8 @@ async function runRender() {
   const cfg=renderConfig || {};
   const frame=(cfg.frame && typeof cfg.frame==='object') ? cfg.frame : {};
   const render=(cfg.render && typeof cfg.render==='object') ? cfg.render : {};
-  const frameWidth=Math.max(240,Math.min(2560,Math.round(Number(frame.width)||1280)));
-  const frameHeight=Math.max(240,Math.min(2560,Math.round(Number(frame.height)||900)));
+  const frameWidth=Math.max(240,Math.min(2560,Math.round(Number(frame.width ?? frame.viewportCssWidth)||1280)));
+  const frameHeight=Math.max(240,Math.min(2560,Math.round(Number(frame.height ?? frame.viewportCssHeight)||900)));
   const longEdge=Math.max(256,Math.min(4096,Math.round(Number(render.longEdge)||1024)));
   const samples=Math.max(1,Math.min(1000,Math.round(Number(render.samples)||20)));
   const bounces=Math.max(1,Math.min(64,Math.round(Number(render.bounces)||20)));
@@ -589,104 +633,163 @@ async function runRender() {
   const includeMmdXps=render.includeMmdXps!==false;
   const ptExpressionEnhance=!!render.ptExpressionEnhance;
   const includeCameraFrame=render.includeCameraFrame!==false;
-  const disablePathTraceCropTiles=render.disablePathTraceCropTiles!==false;
-  const disablePathTraceTiles=render.disablePathTraceTiles!==false;
+  // Crop tiling and internal sample tiling remain deliberately disabled.
+  const disablePathTraceCropTiles=true;
+  const disablePathTraceTiles=true;
+  const cloudFrame={...frame,width:frameWidth,height:frameHeight,aspect:Number(frame.viewportAspect ?? frame.aspect) || (frameWidth/frameHeight)};
   const resultFilename=safeName(cfg.resultFilename || `huesteria_${JOB_ID}.png`,`huesteria_${JOB_ID}.png`);
-  const report={ startedAt:nowIso(), jobId:JOB_ID, podId:POD_ID, config:{frame,render:{...render,longEdge,samples,bounces,mode,includeMmdXps,ptExpressionEnhance,includeCameraFrame,disablePathTraceCropTiles,disablePathTraceTiles}}, success:false };
+  const report={ startedAt:nowIso(), jobId:JOB_ID, podId:POD_ID, config:{frame:cloudFrame,render:{...render,longEdge,samples,bounces,mode,includeMmdXps,ptExpressionEnhance,includeCameraFrame,disablePathTraceCropTiles,disablePathTraceTiles}}, success:false, backendAttempts:[] };
   let page=null;
   try {
     if (!fs.existsSync(SCENE_ZIP)) throw new Error('scene.zip not assembled');
     assertPersistentStorageConfig();
     if (!fs.existsSync(APP_HTML)) throw new Error(`huesteria.html missing: ${APP_HTML}`);
     if (!fs.existsSync(CHROME_EXECUTABLE)) throw new Error(`Chrome missing: ${CHROME_EXECUTABLE}`);
-    await statusPatch({state:'starting',stage:'gpu-probe',samplesDone:0,samplesRequested:samples,progress:0,message:'GPU 브라우저 준비 중…'});
     const staticInfo=await startStaticServer();
-    const launched=await launchHardwareBrowser(staticInfo.url,frameWidth,frameHeight);
-    page=launched.page;
-    report.backend=launched.backend; report.webgl=launched.probe; report.gpuAttempts=launched.attempts;
-    const browserConsole=[]; const pageErrors=[];
-    page.on('console',msg=>{if(browserConsole.length<1000)browserConsole.push(`[${msg.type()}] ${msg.text()}`);});
-    page.on('pageerror',err=>{if(pageErrors.length<200)pageErrors.push(err?.stack||String(err));});
-    page.on('dialog',async d=>{try{await d.dismiss();}catch(_){}});
+    let lastGpuError=null;
 
-    await statusPatch({state:'restoring',stage:'scene-load',message:'장면 ZIP 복원 중…'});
-    await page.evaluate(()=>document.getElementById('shellPresetBtn')?.click());
-    await page.waitForSelector('#sceneProjectLoadZipBtn',{state:'attached',timeout:60_000});
-    await page.evaluate(()=>document.getElementById('sceneProjectLoadZipBtn')?.click());
-    await page.waitForSelector('#sceneProjectLoadInput',{state:'attached',timeout:30_000});
-    await page.locator('#sceneProjectLoadInput').setInputFiles(SCENE_ZIP);
-    await page.waitForFunction(()=>(document.getElementById('sceneProjectStatusLine')?.textContent||'').includes('ZIP 불러오기 완료'),null,{timeout:10*60_000});
-    report.sceneStatus=await page.locator('#sceneProjectStatusLine').textContent();
-
-    await statusPatch({state:'rendering',stage:'pathtrace',samplesDone:0,samplesRequested:samples,progress:0,message:`${longEdge}px / ${samples}spp PT 시작`});
-    const renderStart=Date.now();
-    const downloadPromise=page.waitForEvent('download',{timeout:12*60*60*1000});
-    const evalPromise=page.evaluate(async opts => {
-      return await window.__huesteriaExportHooks.capturePathTracePng({
-        longEdge:opts.longEdge,
-        samples:opts.samples,
-        bounces:opts.bounces,
-        mode:opts.mode,
-        includeMmdXps:opts.includeMmdXps,
-        ptExpressionEnhance:opts.ptExpressionEnhance,
-        disablePathTraceCropTiles:opts.disablePathTraceCropTiles,
-        disablePathTraceTiles:opts.disablePathTraceTiles,
-        pathTraceTiles:1,
-        includeCameraFrame:opts.includeCameraFrame,
-        executionProfile:'cloud-4090',
-        cloudFrame:opts.frame,
-        filename:opts.resultFilename,
-        onProgress:payload=>{window.__huesteriaCloudLiveProgress=payload;}
-      });
-    },{longEdge,samples,bounces,mode,includeMmdXps,ptExpressionEnhance,disablePathTraceCropTiles,disablePathTraceTiles,includeCameraFrame,resultFilename,frame:{width:frameWidth,height:frameHeight,aspect:frameWidth/frameHeight}});
-
-    let busy=false; let lastPreviewAt=0; let lastPreviewSample=-1;
-    const progressTimer=setInterval(async()=>{
-      if(busy||!page) return; busy=true;
+    for (let backendIndex=0; backendIndex<backendCandidates.length; backendIndex++) {
+      const backend=backendCandidates[backendIndex];
+      const attemptNo=backendIndex+1;
+      let launched=null;
+      let browserConsole=[];
+      let pageErrors=[];
+      let progressTimer=null;
+      let backendPhase='launch';
       try {
-        const p=await page.evaluate(()=>window.__huesteriaCloudLiveProgress||null);
-        if(p){
-          const done=Math.max(0,Number(p.samplesDone||0));
-          const requested=Math.max(1,Number(p.samplesRequested||samples));
-          const progress=Number.isFinite(Number(p.progress))?Number(p.progress):done/requested;
-          await statusPatch({state:'rendering',stage:p.stage||'rendering',samplesDone:done,samplesRequested:requested,progress,message:p.message||'클라우드 PT 렌더 중…'});
-          const now=Date.now();
-          if(done!==lastPreviewSample && now-lastPreviewAt>=1500){
-            if(await writeLivePreview(page)){lastPreviewAt=now;lastPreviewSample=done;}
-          }
+        if(cancelRequested) throw new Error('cancelled');
+        await closeBrowser();
+        await statusPatch({state:'starting',stage:'backend-launch',samplesDone:0,samplesRequested:samples,progress:0,backend:backend.name,backendAttempt:attemptNo,backendAttemptTotal:backendCandidates.length,message:`GPU backend ${attemptNo}/${backendCandidates.length} · ${backend.name} 시작`});
+        launched=await launchHardwareBrowserForBackend(staticInfo.url,frameWidth,frameHeight,backend);
+        page=launched.page;
+        browserConsole=[]; pageErrors=[];
+        page.on('console',msg=>{if(browserConsole.length<1000)browserConsole.push(`[${msg.type()}] ${msg.text()}`);});
+        page.on('pageerror',err=>{if(pageErrors.length<200)pageErrors.push(err?.stack||String(err));});
+        page.on('dialog',async d=>{try{await d.dismiss();}catch(_){}});
+        const deviceSummary=(launched.devices||[]).map(d=>d.deviceString||d.vendorString||'').filter(Boolean).join(' | ');
+        report.backendAttempts.push({backend:backend.name,attempt:attemptNo,probe:launched.probe,devices:launched.devices||[],phase:'basic-probe-ok'});
+
+        backendPhase='scene-load';
+        await statusPatch({state:'restoring',stage:'scene-load',backend:backend.name,backendAttempt:attemptNo,gpuRenderer:launched.probe?.renderer||'',gpuVendor:launched.probe?.vendor||'',gpuDevices:deviceSummary,message:`${backend.name} · 장면 ZIP 복원 중…`});
+        const sceneStatus=await restoreSceneOnPage(page);
+
+        backendPhase='pathtrace-preflight';
+        await statusPatch({state:'starting',stage:'pathtrace-preflight',backend:backend.name,backendAttempt:attemptNo,gpuRenderer:launched.probe?.renderer||'',gpuVendor:launched.probe?.vendor||'',gpuDevices:deviceSummary,message:`${backend.name} · 실제 PT 준비 검증 256px / 1spp`});
+        const warmup=await runBackendWarmup(page,{bounces,mode,includeMmdXps,ptExpressionEnhance,frame:cloudFrame});
+        const currentAttempt=report.backendAttempts[report.backendAttempts.length-1];
+        currentAttempt.phase='pathtrace-preflight-ok';
+        currentAttempt.preflightMeta=warmup.meta;
+        currentAttempt.sceneStatus=sceneStatus;
+        report.sceneStatus=sceneStatus;
+
+        backendPhase='render';
+        report.backend=backend.name;
+        report.webgl=launched.probe;
+        report.gpuInfo=launched.gpuInfo;
+        await page.evaluate(()=>{ window.__huesteriaCloudLiveProgress = null; });
+        await statusPatch({state:'rendering',stage:'pathtrace',samplesDone:0,samplesRequested:samples,progress:0,backend:backend.name,backendAttempt:attemptNo,gpuRenderer:launched.probe?.renderer||'',gpuVendor:launched.probe?.vendor||'',gpuDevices:deviceSummary,message:`${backend.name} 검증 통과 · ${longEdge}px / ${samples}spp PT 시작`});
+        const renderStart=Date.now();
+        const downloadPromise=page.waitForEvent('download',{timeout:12*60*60*1000});
+        const evalPromise=page.evaluate(async opts => {
+          return await window.__huesteriaExportHooks.capturePathTracePng({
+            longEdge:opts.longEdge,
+            samples:opts.samples,
+            bounces:opts.bounces,
+            mode:opts.mode,
+            includeMmdXps:opts.includeMmdXps,
+            ptExpressionEnhance:opts.ptExpressionEnhance,
+            disablePathTraceCropTiles:true,
+            disablePathTraceTiles:true,
+            pathTraceTiles:1,
+            includeCameraFrame:opts.includeCameraFrame,
+            executionProfile:'cloud-4090',
+            cloudFrame:opts.frame,
+            filename:opts.resultFilename,
+            onProgress:payload=>{window.__huesteriaCloudLiveProgress=payload;}
+          });
+        },{longEdge,samples,bounces,mode,includeMmdXps,ptExpressionEnhance,includeCameraFrame,resultFilename,frame:cloudFrame});
+
+        let busy=false; let lastPreviewAt=0; let lastPreviewSample=-1;
+        progressTimer=setInterval(async()=>{
+          if(busy||!page) return; busy=true;
+          try {
+            const p=await page.evaluate(()=>window.__huesteriaCloudLiveProgress||null);
+            if(p){
+              const done=Math.max(0,Number(p.samplesDone||0));
+              const requested=Math.max(1,Number(p.samplesRequested||samples));
+              const progress=Number.isFinite(Number(p.progress))?Number(p.progress):done/requested;
+              await statusPatch({state:'rendering',stage:p.stage||'rendering',samplesDone:done,samplesRequested:requested,progress,backend:backend.name,backendAttempt:attemptNo,gpuRenderer:launched.probe?.renderer||'',message:`${backend.name} · ${p.message||'클라우드 PT 렌더 중…'}`});
+              const now=Date.now();
+              if(done!==lastPreviewSample && now-lastPreviewAt>=1500){
+                if(await writeLivePreview(page)){lastPreviewAt=now;lastPreviewSample=done;}
+              }
+            }
+            if(cancelRequested) await closeBrowser();
+          } catch(_){} finally{busy=false;}
+        },700);
+
+        let download,result;
+        try { [download,result]=await Promise.all([downloadPromise,evalPromise]); }
+        finally { if(progressTimer){clearInterval(progressTimer);progressTimer=null;} }
+        if(cancelRequested) throw new Error('cancelled');
+        const meta=await page.evaluate(()=>window.__huesteriaExportHooks.getLastPathTraceMeta?.()||null);
+        if(meta?.webglContextLost || meta?.partialContextLost || meta?.captureResult==='partial-saved-after-failure') {
+          try { await download.delete(); } catch (_) {}
+          const error=new Error(`GPU_CONTEXT_LOST_DURING_RENDER · backend=${backend.name} stage=${meta?.failedStage || meta?.stage || 'unknown'}`);
+          error.meta=meta;
+          throw error;
         }
-        if(cancelRequested) await closeBrowser();
-      } catch(_){} finally{busy=false;}
-    },700);
 
-    let download,result;
-    try { [download,result]=await Promise.all([downloadPromise,evalPromise]); }
-    finally { clearInterval(progressTimer); }
-    if(cancelRequested) throw new Error('cancelled');
-
-    await fsp.mkdir(RESULT_DIR,{recursive:true});
-    const finalTmp=path.join(RESULT_DIR,`final.${process.pid}.tmp`);
-    await download.saveAs(finalTmp);
-    await fsp.rename(finalTmp,RESULT_PNG);
-    const stat=await fsp.stat(RESULT_PNG);
-    if(stat.size<=0) throw new Error('final PNG is empty');
-    await writeLivePreview(page).catch(()=>false);
-    if(fs.existsSync(PREVIEW_PATH)) await fsp.copyFile(PREVIEW_PATH,RESULT_PREVIEW);
-    const renderMs=Date.now()-renderStart;
-    const meta=await page.evaluate(()=>window.__huesteriaExportHooks.getLastPathTraceMeta?.()||null);
-    report.success=true; report.finishedAt=nowIso(); report.renderMs=renderMs; report.renderSeconds=renderMs/1000; report.result=result; report.meta=meta; report.output={path:RESULT_PNG,bytes:stat.size}; report.browserConsole=browserConsole.slice(-300); report.pageErrors=pageErrors.slice(-100);
-    await atomicJson(RESULT_META,report);
-    await statusPatch({state:'rendering',stage:'persisting_result',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,message:'렌더 완료 · Network Volume S3에 최종 PNG 저장 중…',resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta});
-    const persistence=await persistRenderArtifacts(report);
-    await statusPatch({state:'completed',stage:'completed',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,message:'렌더 완료 · 영구 저장 검증 완료',resultPersistent:true,resultKey:persistence.final.key,resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta,persistence:{verified:true,datacenter:S3_DATACENTER,volumeId:S3_VOLUME_ID,finalKey:persistence.final.key,warnings:persistence.warnings||[]}});
-    await cleanupTemp({keepStatus:true});
-    scheduleSelfDelete('completed',20_000);
-    return report;
+        await fsp.mkdir(RESULT_DIR,{recursive:true});
+        const finalTmp=path.join(RESULT_DIR,`final.${process.pid}.tmp`);
+        await download.saveAs(finalTmp);
+        await fsp.rename(finalTmp,RESULT_PNG);
+        const stat=await fsp.stat(RESULT_PNG);
+        if(stat.size<=0) throw new Error('final PNG is empty');
+        await writeLivePreview(page).catch(()=>false);
+        if(fs.existsSync(PREVIEW_PATH)) await fsp.copyFile(PREVIEW_PATH,RESULT_PREVIEW);
+        const renderMs=Date.now()-renderStart;
+        const currentSuccessAttempt=report.backendAttempts[report.backendAttempts.length-1];
+        currentSuccessAttempt.phase='render-ok';
+        currentSuccessAttempt.renderSeconds=renderMs/1000;
+        report.success=true; report.finishedAt=nowIso(); report.renderMs=renderMs; report.renderSeconds=renderMs/1000; report.result=result; report.meta=meta; report.output={path:RESULT_PNG,bytes:stat.size}; report.browserConsole=browserConsole.slice(-300); report.pageErrors=pageErrors.slice(-100);
+        await atomicJson(RESULT_META,report);
+        await statusPatch({state:'rendering',stage:'persisting_result',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,backend:backend.name,backendAttempt:attemptNo,message:`${backend.name} · 렌더 완료 · Network Volume S3에 최종 PNG 저장 중…`,resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta});
+        const persistence=await persistRenderArtifacts(report);
+        await statusPatch({state:'completed',stage:'completed',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,backend:backend.name,backendAttempt:attemptNo,message:`렌더 완료 · ${backend.name} · 영구 저장 검증 완료`,resultPersistent:true,resultKey:persistence.final.key,resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta,persistence:{verified:true,datacenter:S3_DATACENTER,volumeId:S3_VOLUME_ID,finalKey:persistence.final.key,warnings:persistence.warnings||[]},backendAttempts:report.backendAttempts});
+        await cleanupTemp({keepStatus:true});
+        scheduleSelfDelete('completed',20_000);
+        return report;
+      } catch(error) {
+        if(progressTimer){clearInterval(progressTimer);progressTimer=null;}
+        const cancelled=cancelRequested || String(error?.message||'').toLowerCase()==='cancelled';
+        const retryable=!cancelled && isRetryableGpuContextError(error);
+        const attemptRecord=report.backendAttempts.findLast?.(a=>a.backend===backend.name && a.attempt===attemptNo) || report.backendAttempts[report.backendAttempts.length-1];
+        if(attemptRecord && attemptRecord.backend===backend.name){attemptRecord.phase=`${backendPhase}-failed`;attemptRecord.error=error?.stack||String(error);if(error?.meta)attemptRecord.failureMeta=error.meta;}
+        else report.backendAttempts.push({backend:backend.name,attempt:attemptNo,phase:`${backendPhase}-failed`,error:error?.stack||String(error),failureMeta:error?.meta||null});
+        lastGpuError=error;
+        await closeBrowser(); page=null;
+        if(cancelled) throw error;
+        if(retryable && backendIndex < backendCandidates.length-1) {
+          const next=backendCandidates[backendIndex+1];
+          await statusPatch({state:'starting',stage:'backend-fallback',samplesDone:0,samplesRequested:samples,progress:0,backend:backend.name,backendAttempt:attemptNo,backendAttempts:report.backendAttempts,message:`${backend.name} ${backendPhase}에서 GPU context 실패 · ${next.name}으로 자동 재시도`});
+          continue;
+        }
+        if(retryable) {
+          const finalError=new Error(`GPU_BACKEND_EXHAUSTED · 모든 backend 실패 · 마지막=${backend.name} · ${error?.message||error}`);
+          finalError.cause=error;
+          finalError.attempts=report.backendAttempts;
+          throw finalError;
+        }
+        throw error;
+      }
+    }
+    throw lastGpuError || new Error('GPU backend selection failed');
   } catch(error){
     const cancelled=cancelRequested || String(error?.message||'').toLowerCase()==='cancelled';
     report.success=false; report.finishedAt=nowIso(); report.error=error?.stack||String(error);
     try{await fsp.rm(RESULT_DIR,{recursive:true,force:true});}catch(_){}
-    await statusPatch({state:cancelled?'cancelled':'failed',stage:cancelled?'cancelled':'failed',message:cancelled?'렌더 취소됨':(error?.message||String(error)),error:cancelled?undefined:(error?.stack||String(error))}).catch(()=>{});
+    await statusPatch({state:cancelled?'cancelled':'failed',stage:cancelled?'cancelled':'failed',message:cancelled?'렌더 취소됨':(error?.message||String(error)),error:cancelled?undefined:(error?.stack||String(error)),backendAttempts:report.backendAttempts}).catch(()=>{});
     await cleanupTemp({keepStatus:true});
     scheduleSelfDelete(cancelled?'cancelled':'failed',15_000);
     throw error;
@@ -695,7 +798,6 @@ async function runRender() {
     if(staticServer?.server){try{staticServer.server.close();}catch(_){} staticServer=null;}
   }
 }
-
 const apiServer=http.createServer(async(req,res)=>{
   try{
     const url=new URL(req.url,'http://127.0.0.1');
@@ -703,7 +805,7 @@ const apiServer=http.createServer(async(req,res)=>{
     if(req.method==='OPTIONS'){res.statusCode=204;cors(res);res.end();return;}
     if(pathname==='/health'){
       const st=await currentStatus();
-      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v4',buildId:BUILD_ID,jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,containerReady:true,localStorageReady:true,rendererReady:fs.existsSync(CHROME_EXECUTABLE),runtimeReady:fs.existsSync(APP_HTML),resultPersistent:st.resultPersistent===true,s3Configured:!!(S3_DATACENTER&&S3_VOLUME_ID&&S3_ACCESS_KEY&&S3_SECRET_KEY)});return;
+      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v5',buildId:BUILD_ID,jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,containerReady:true,localStorageReady:true,rendererReady:fs.existsSync(CHROME_EXECUTABLE),runtimeReady:fs.existsSync(APP_HTML),resultPersistent:st.resultPersistent===true,s3Configured:!!(S3_DATACENTER&&S3_VOLUME_ID&&S3_ACCESS_KEY&&S3_SECRET_KEY)});return;
     }
     if(!authorized(req)){sendJson(res,401,{error:'unauthorized'});return;}
     touchActivity();
