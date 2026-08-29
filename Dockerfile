@@ -33,7 +33,6 @@ RUN npm init -y >/dev/null 2>&1 \
  && npm cache clean --force
 
 COPY worker.mjs /opt/huesteria/worker.mjs
-COPY huesteria.html /opt/huesteria/huesteria.html
 
 LABEL org.opencontainers.image.title="Huesteria Cloud Renderer" \
       org.opencontainers.image.description="Prebuilt RTX 4090 Huesteria WebGL path tracing worker" \

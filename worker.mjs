@@ -22,7 +22,9 @@ const RESULT_DIR = path.join(RESULT_ROOT, JOB_ID);
 const RESULT_PNG = path.join(RESULT_DIR, 'final.png');
 const RESULT_META = path.join(RESULT_DIR, 'meta.json');
 const RESULT_PREVIEW = path.join(RESULT_DIR, 'preview.jpg');
-const APP_HTML = path.join(__dirname, 'huesteria.html');
+const RUNTIME_DIR = path.join(TEMP_ROOT, 'runtime');
+const APP_HTML = path.join(RUNTIME_DIR, 'huesteria.html');
+const RUNTIME_MAX_BYTES = 16 * 1024 * 1024;
 const CHROME_EXECUTABLE = process.env.CHROME_EXECUTABLE || '/usr/bin/google-chrome';
 const CHUNK_MAX_BYTES = 32 * 1024 * 1024;
 const IDLE_TTL_MS = Math.max(2, Number(process.env.HUESTERIA_IDLE_TTL_MINUTES || 5)) * 60_000;
@@ -41,6 +43,7 @@ let staticServer = null;
 
 await fsp.mkdir(TEMP_ROOT, { recursive: true });
 await fsp.mkdir(PARTS_DIR, { recursive: true });
+await fsp.mkdir(RUNTIME_DIR, { recursive: true });
 await fsp.mkdir(RESULT_ROOT, { recursive: true });
 
 function nowIso() { return new Date().toISOString(); }
@@ -74,6 +77,7 @@ async function currentStatus() {
     samplesDone: 0,
     samplesRequested: Math.max(1, Number(renderConfig?.render?.samples || 20)),
     message: fs.existsSync(SCENE_ZIP) ? '장면 ZIP 준비 완료' : 'GPU 준비 완료 · 장면 업로드 대기',
+    runtimeReady: fs.existsSync(APP_HTML),
     previewRevision,
     updatedAt: nowIso()
   });
@@ -447,12 +451,20 @@ const apiServer=http.createServer(async(req,res)=>{
     if(req.method==='OPTIONS'){res.statusCode=204;cors(res);res.end();return;}
     if(pathname==='/health'){
       const st=await currentStatus();
-      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v1',jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,rendererReady:fs.existsSync(APP_HTML)&&fs.existsSync(CHROME_EXECUTABLE),resultPersistent:fs.existsSync(RESULT_PNG)});return;
+      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v2',jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,rendererReady:fs.existsSync(CHROME_EXECUTABLE),runtimeReady:fs.existsSync(APP_HTML),resultPersistent:fs.existsSync(RESULT_PNG)});return;
     }
     if(!authorized(req)){sendJson(res,401,{error:'unauthorized'});return;}
     touchActivity();
     const prefix=`/v1/jobs/${encodeURIComponent(JOB_ID)}`;
     if(pathname===`${prefix}/status` && req.method==='GET'){sendJson(res,200,await currentStatus());return;}
+    if(pathname===`${prefix}/runtime` && req.method==='PUT'){
+      if(renderPromise){sendJson(res,409,{error:'render already started'});return;}
+      await fsp.mkdir(RUNTIME_DIR,{recursive:true});
+      const bytes=await streamRequestToFile(req,APP_HTML,RUNTIME_MAX_BYTES);
+      if(bytes<=1024){try{await fsp.rm(APP_HTML,{force:true});}catch(_){} sendJson(res,400,{error:'runtime html too small'});return;}
+      await statusPatch({runtimeReady:true,message:'Huesteria 렌더 런타임 준비 완료'});
+      sendJson(res,201,{ok:true,runtimeReady:true,bytes});return;
+    }
     if(pathname===`${prefix}/upload` && req.method==='GET'){
       const parts=await receivedParts();
       const st=await currentStatus();
@@ -478,6 +490,7 @@ const apiServer=http.createServer(async(req,res)=>{
       sendJson(res,201,result);return;
     }
     if(pathname===`${prefix}/start` && req.method==='POST'){
+      if(!fs.existsSync(APP_HTML)){sendJson(res,409,{error:'runtime html not uploaded'});return;}
       if(!fs.existsSync(SCENE_ZIP)){sendJson(res,409,{error:'scene not assembled'});return;}
       if(renderPromise){sendJson(res,202,{ok:true,state:(await currentStatus()).state});return;}
       cancelRequested=false;
