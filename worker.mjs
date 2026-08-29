@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -17,7 +18,7 @@ const SCENE_ZIP = path.join(TEMP_ROOT, 'scene.zip');
 const STATUS_PATH = path.join(TEMP_ROOT, 'status.json');
 const PREVIEW_PATH = path.join(TEMP_ROOT, 'preview.jpg');
 const WORKER_LOG_PATH = path.join(TEMP_ROOT, 'worker.log');
-const RESULT_ROOT = path.resolve(process.env.HUESTERIA_RESULT_ROOT || '/workspace/huesteria-results');
+const RESULT_ROOT = path.resolve(process.env.HUESTERIA_RESULT_ROOT || '/tmp/huesteria-results');
 const RESULT_DIR = path.join(RESULT_ROOT, JOB_ID);
 const RESULT_PNG = path.join(RESULT_DIR, 'final.png');
 const RESULT_META = path.join(RESULT_DIR, 'meta.json');
@@ -30,6 +31,14 @@ const CHUNK_MAX_BYTES = 32 * 1024 * 1024;
 const IDLE_TTL_MS = Math.max(2, Number(process.env.HUESTERIA_IDLE_TTL_MINUTES || 5)) * 60_000;
 const HARD_TTL_MS = Math.max(30, Number(process.env.HUESTERIA_HARD_TTL_MINUTES || 720)) * 60_000;
 
+const S3_DATACENTER = String(process.env.HUESTERIA_S3_DATACENTER || '').trim().toUpperCase();
+const S3_VOLUME_ID = String(process.env.HUESTERIA_S3_VOLUME_ID || '').trim();
+const S3_ACCESS_KEY = String(process.env.HUESTERIA_S3_ACCESS_KEY || '').trim();
+const S3_SECRET_KEY = String(process.env.HUESTERIA_S3_SECRET_KEY || '').trim();
+const S3_PREFIX = String(process.env.HUESTERIA_S3_PREFIX || 'huesteria-results').trim().replace(/^\/+|\/+$/g, '') || 'huesteria-results';
+const S3_SINGLE_PUT_MAX_BYTES = 500 * 1024 * 1024;
+const S3_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+
 let renderConfig = {};
 try { renderConfig = JSON.parse(process.env.HUESTERIA_RENDER_CONFIG || '{}'); } catch (_) {}
 
@@ -40,11 +49,31 @@ let previewRevision = 0;
 let lastActivityAt = Date.now();
 let selfDeleteScheduled = false;
 let staticServer = null;
+const BUILD_ID = 'huesteria-worker-v4-20260829';
 
-await fsp.mkdir(TEMP_ROOT, { recursive: true });
-await fsp.mkdir(PARTS_DIR, { recursive: true });
-await fsp.mkdir(RUNTIME_DIR, { recursive: true });
-await fsp.mkdir(RESULT_ROOT, { recursive: true });
+process.on('uncaughtException', (error) => {
+  console.error('[Huesteria startup fatal] uncaughtException', error?.stack || error);
+  process.exit(1);
+});
+process.on('unhandledRejection', (error) => {
+  console.error('[Huesteria startup fatal] unhandledRejection', error?.stack || error);
+  process.exit(1);
+});
+
+console.log(`[Huesteria GHCR Worker] process-start build=${BUILD_ID} pid=${process.pid}`);
+console.log(`[Huesteria GHCR Worker] node=${process.version} resultRoot=${RESULT_ROOT}`);
+console.log(`[Huesteria GHCR Worker] env job=${JOB_ID} pod=${POD_ID || '(unset)'} token=${TOKEN ? 'set' : 'missing'} s3=${(S3_DATACENTER&&S3_VOLUME_ID&&S3_ACCESS_KEY&&S3_SECRET_KEY) ? 'configured' : 'missing'}`);
+
+try {
+  await fsp.mkdir(TEMP_ROOT, { recursive: true });
+  await fsp.mkdir(PARTS_DIR, { recursive: true });
+  await fsp.mkdir(RUNTIME_DIR, { recursive: true });
+  await fsp.mkdir(RESULT_ROOT, { recursive: true });
+  console.log('[Huesteria GHCR Worker] local-init-ok');
+} catch (error) {
+  console.error('[Huesteria GHCR Worker] local-init-failed', error?.stack || error);
+  throw error;
+}
 
 function nowIso() { return new Date().toISOString(); }
 function touchActivity() { lastActivityAt = Date.now(); }
@@ -186,22 +215,241 @@ async function assembleScene({ totalChunks, totalBytes }) {
   return { ok:true, bytes:written };
 }
 
+
+function assertPersistentStorageConfig() {
+  const missing = [];
+  if (!S3_DATACENTER) missing.push('HUESTERIA_S3_DATACENTER');
+  if (!S3_VOLUME_ID) missing.push('HUESTERIA_S3_VOLUME_ID');
+  if (!S3_ACCESS_KEY) missing.push('HUESTERIA_S3_ACCESS_KEY');
+  if (!S3_SECRET_KEY) missing.push('HUESTERIA_S3_SECRET_KEY');
+  if (missing.length) throw new Error(`persistent S3 configuration missing: ${missing.join(', ')}`);
+}
+
+function awsUriEncode(value) {
+  return encodeURIComponent(String(value)).replace(/[!'()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function s3ObjectPath(key = '') {
+  let out = `/${awsUriEncode(S3_VOLUME_ID)}`;
+  const clean = String(key || '').replace(/^\/+/, '');
+  if (clean) out += '/' + clean.split('/').map(awsUriEncode).join('/');
+  return out;
+}
+
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function hmacSha256(key, value) {
+  return crypto.createHmac('sha256', key).update(value, 'utf8').digest();
+}
+
+async function sha256FileHex(filePath) {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+function s3SignedRequestHeaders({ method, key, payloadHash, contentType = '', contentLength = null, now = new Date() }) {
+  assertPersistentStorageConfig();
+  const host = `s3api-${S3_DATACENTER.toLowerCase()}.runpod.io`;
+  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const canonicalUri = s3ObjectPath(key);
+  const canonicalHeaderMap = {
+    host,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzDate,
+  };
+  if (contentType) canonicalHeaderMap['content-type'] = contentType;
+  const signedHeaderNames = Object.keys(canonicalHeaderMap).sort();
+  const canonicalHeaders = signedHeaderNames.map(name => `${name}:${String(canonicalHeaderMap[name]).trim()}\n`).join('');
+  const signedHeaders = signedHeaderNames.join(';');
+  const canonicalRequest = [
+    String(method || 'GET').toUpperCase(),
+    canonicalUri,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+  const scope = `${dateStamp}/${S3_DATACENTER}/s3/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    scope,
+    sha256Hex(Buffer.from(canonicalRequest, 'utf8')),
+  ].join('\n');
+  const kDate = hmacSha256(Buffer.from(`AWS4${S3_SECRET_KEY}`, 'utf8'), dateStamp);
+  const kRegion = hmacSha256(kDate, S3_DATACENTER);
+  const kService = hmacSha256(kRegion, 's3');
+  const kSigning = hmacSha256(kService, 'aws4_request');
+  const signature = crypto.createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex');
+  const headers = {
+    Host: host,
+    Authorization: `AWS4-HMAC-SHA256 Credential=${S3_ACCESS_KEY}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Content-Sha256': payloadHash,
+    'Accept-Encoding': 'identity',
+    'User-Agent': 'Huesteria-GHCR-Worker/3.0',
+  };
+  if (contentType) headers['Content-Type'] = contentType;
+  if (contentLength !== null && Number.isFinite(Number(contentLength))) headers['Content-Length'] = String(contentLength);
+  return { host, path: canonicalUri, headers };
+}
+
+function requestS3({ method, key, payloadHash, contentType = '', contentLength = null, filePath = null, timeoutMs = 180_000 }) {
+  const signed = s3SignedRequestHeaders({ method, key, payloadHash, contentType, contentLength });
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    const req = https.request({
+      protocol: 'https:',
+      hostname: signed.host,
+      port: 443,
+      method,
+      path: signed.path,
+      headers: signed.headers,
+      timeout: timeoutMs,
+    }, res => {
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes <= 256 * 1024) chunks.push(chunk);
+      });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          status: Number(res.statusCode || 0),
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error(`S3 ${method} timeout`)));
+    req.on('error', finishReject);
+    if (filePath) {
+      const stream = fs.createReadStream(filePath);
+      stream.on('error', error => { try { req.destroy(error); } catch (_) {} finishReject(error); });
+      stream.pipe(req);
+    } else {
+      req.end();
+    }
+  });
+}
+
+async function withS3Retries(label, fn, attempts = 6) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fn(attempt);
+      if (response.status >= 200 && response.status < 300) return response;
+      const detail = String(response.body || '').replace(/\s+/g, ' ').slice(0, 400);
+      const error = new Error(`${label} failed (${response.status})${detail ? ` · ${detail}` : ''}`);
+      error.status = response.status;
+      if (!S3_RETRYABLE_STATUS.has(response.status) || attempt >= attempts) throw error;
+      lastError = error;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || (Number(error?.status) && !S3_RETRYABLE_STATUS.has(Number(error.status)))) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(10_000, 700 * (2 ** (attempt - 1)))));
+  }
+  throw lastError || new Error(`${label} failed`);
+}
+
+async function putPersistentFile(key, filePath, contentType) {
+  assertPersistentStorageConfig();
+  const stat = await fsp.stat(filePath);
+  if (!stat.isFile() || stat.size <= 0) throw new Error(`persistent upload source is empty: ${filePath}`);
+  if (stat.size > S3_SINGLE_PUT_MAX_BYTES) {
+    throw new Error(`persistent result exceeds RunPod S3 single-object upload limit (${stat.size} bytes > ${S3_SINGLE_PUT_MAX_BYTES})`);
+  }
+  const payloadHash = await sha256FileHex(filePath);
+  const response = await withS3Retries(`S3 PUT ${key}`, () => requestS3({
+    method: 'PUT', key, payloadHash, contentType, contentLength: stat.size, filePath,
+  }));
+  return { key, bytes: stat.size, etag: String(response.headers?.etag || '').replace(/^"|"$/g, '') };
+}
+
+async function headPersistentFile(key, expectedBytes = null) {
+  assertPersistentStorageConfig();
+  const emptyHash = sha256Hex(Buffer.alloc(0));
+  const response = await withS3Retries(`S3 HEAD ${key}`, () => requestS3({
+    method: 'HEAD', key, payloadHash: emptyHash,
+  }));
+  const bytes = Number(response.headers?.['content-length'] || 0);
+  if (expectedBytes !== null && Number(expectedBytes) > 0 && bytes !== Number(expectedBytes)) {
+    throw new Error(`persistent object size mismatch for ${key}: expected ${expectedBytes}, got ${bytes}`);
+  }
+  return { key, bytes, etag: String(response.headers?.etag || '').replace(/^"|"$/g, '') };
+}
+
+async function persistRenderArtifacts(report) {
+  assertPersistentStorageConfig();
+  const baseKey = `${S3_PREFIX}/${JOB_ID}`;
+  const finalKey = `${baseKey}/final.png`;
+  const previewKey = `${baseKey}/preview.jpg`;
+  const metaKey = `${baseKey}/meta.json`;
+  const warnings = [];
+
+  const finalPut = await putPersistentFile(finalKey, RESULT_PNG, 'image/png');
+  const finalHead = await headPersistentFile(finalKey, finalPut.bytes);
+
+  let preview = null;
+  if (fs.existsSync(RESULT_PREVIEW)) {
+    try { preview = await putPersistentFile(previewKey, RESULT_PREVIEW, 'image/jpeg'); }
+    catch (error) { warnings.push(`preview: ${error?.message || error}`); }
+  }
+
+  report.persistence = {
+    verified: true,
+    verifiedAt: nowIso(),
+    datacenter: S3_DATACENTER,
+    volumeId: S3_VOLUME_ID,
+    final: { ...finalPut, headBytes: finalHead.bytes },
+    preview,
+    metaKey,
+    warnings,
+  };
+  await atomicJson(RESULT_META, report);
+  try {
+    report.persistence.meta = await putPersistentFile(metaKey, RESULT_META, 'application/json');
+  } catch (error) {
+    warnings.push(`meta: ${error?.message || error}`);
+    await atomicJson(RESULT_META, report);
+  }
+  return report.persistence;
+}
+
 async function selfDelete(reason) {
   if (selfDeleteScheduled) return;
   selfDeleteScheduled = true;
   const apiKey = String(process.env.RUNPOD_API_KEY || '').trim();
   if (!POD_ID || !apiKey) {
     console.warn('[Huesteria] self delete skipped: RUNPOD_POD_ID or RUNPOD_API_KEY missing');
+    selfDeleteScheduled = false;
     return;
   }
   try {
     const response = await fetch(`https://rest.runpod.io/v1/pods/${encodeURIComponent(POD_ID)}`, {
       method:'DELETE', headers:{ Authorization:`Bearer ${apiKey}` }
     });
+    if (!response.ok && response.status !== 404) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`RunPod DELETE ${response.status}${text ? ` · ${text.slice(0,300)}` : ''}`);
+    }
     console.log(`[Huesteria] self delete (${reason}) -> ${response.status}`);
   } catch (error) {
     console.warn('[Huesteria] self delete failed', error);
     selfDeleteScheduled = false;
+    setTimeout(() => selfDelete(`${reason}-retry`), 30_000).unref();
   }
 }
 function scheduleSelfDelete(reason, delayMs = 15_000) {
@@ -348,6 +596,7 @@ async function runRender() {
   let page=null;
   try {
     if (!fs.existsSync(SCENE_ZIP)) throw new Error('scene.zip not assembled');
+    assertPersistentStorageConfig();
     if (!fs.existsSync(APP_HTML)) throw new Error(`huesteria.html missing: ${APP_HTML}`);
     if (!fs.existsSync(CHROME_EXECUTABLE)) throw new Error(`Chrome missing: ${CHROME_EXECUTABLE}`);
     await statusPatch({state:'starting',stage:'gpu-probe',samplesDone:0,samplesRequested:samples,progress:0,message:'GPU 브라우저 준비 중…'});
@@ -421,12 +670,15 @@ async function runRender() {
     await fsp.rename(finalTmp,RESULT_PNG);
     const stat=await fsp.stat(RESULT_PNG);
     if(stat.size<=0) throw new Error('final PNG is empty');
+    await writeLivePreview(page).catch(()=>false);
     if(fs.existsSync(PREVIEW_PATH)) await fsp.copyFile(PREVIEW_PATH,RESULT_PREVIEW);
     const renderMs=Date.now()-renderStart;
     const meta=await page.evaluate(()=>window.__huesteriaExportHooks.getLastPathTraceMeta?.()||null);
     report.success=true; report.finishedAt=nowIso(); report.renderMs=renderMs; report.renderSeconds=renderMs/1000; report.result=result; report.meta=meta; report.output={path:RESULT_PNG,bytes:stat.size}; report.browserConsole=browserConsole.slice(-300); report.pageErrors=pageErrors.slice(-100);
     await atomicJson(RESULT_META,report);
-    await statusPatch({state:'completed',stage:'completed',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,message:'렌더 완료 · 영구 저장 확인',resultKey:`huesteria-results/${JOB_ID}/final.png`,resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta});
+    await statusPatch({state:'rendering',stage:'persisting_result',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,message:'렌더 완료 · Network Volume S3에 최종 PNG 저장 중…',resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta});
+    const persistence=await persistRenderArtifacts(report);
+    await statusPatch({state:'completed',stage:'completed',samplesDone:meta?.samplesDone??samples,samplesRequested:meta?.samplesRequested??samples,progress:1,message:'렌더 완료 · 영구 저장 검증 완료',resultPersistent:true,resultKey:persistence.final.key,resultFilename,width:result?.width||0,height:result?.height||0,bytes:stat.size,renderSeconds:renderMs/1000,meta,persistence:{verified:true,datacenter:S3_DATACENTER,volumeId:S3_VOLUME_ID,finalKey:persistence.final.key,warnings:persistence.warnings||[]}});
     await cleanupTemp({keepStatus:true});
     scheduleSelfDelete('completed',20_000);
     return report;
@@ -451,7 +703,7 @@ const apiServer=http.createServer(async(req,res)=>{
     if(req.method==='OPTIONS'){res.statusCode=204;cors(res);res.end();return;}
     if(pathname==='/health'){
       const st=await currentStatus();
-      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v2',jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,rendererReady:fs.existsSync(CHROME_EXECUTABLE),runtimeReady:fs.existsSync(APP_HTML),resultPersistent:fs.existsSync(RESULT_PNG)});return;
+      sendJson(res,200,{ok:true,service:'huesteria-ghcr-worker-v4',buildId:BUILD_ID,jobId:JOB_ID,podId:POD_ID,state:st.state,stage:st.stage,containerReady:true,localStorageReady:true,rendererReady:fs.existsSync(CHROME_EXECUTABLE),runtimeReady:fs.existsSync(APP_HTML),resultPersistent:st.resultPersistent===true,s3Configured:!!(S3_DATACENTER&&S3_VOLUME_ID&&S3_ACCESS_KEY&&S3_SECRET_KEY)});return;
     }
     if(!authorized(req)){sendJson(res,401,{error:'unauthorized'});return;}
     touchActivity();
@@ -520,7 +772,7 @@ const apiServer=http.createServer(async(req,res)=>{
 });
 
 apiServer.listen(PORT,'0.0.0.0',()=>{
-  console.log(`[Huesteria GHCR Worker] listening 0.0.0.0:${PORT}`);
+  console.log(`[Huesteria GHCR Worker] listening 0.0.0.0:${PORT} build=${BUILD_ID}`);
   console.log(`[Huesteria GHCR Worker] job=${JOB_ID} pod=${POD_ID}`);
 });
 
