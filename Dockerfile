@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.1-base-ubuntu22.04
+FROM ubuntu:22.04
 
 ARG GITHUB_REPOSITORY=unknown/huesteria-cloud
 
@@ -6,12 +6,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
     PORT=4000 \
     CHROME_EXECUTABLE=/usr/bin/google-chrome \
-    HUESTERIA_RESULT_ROOT=/tmp/huesteria-results
+    HUESTERIA_RESULT_ROOT=/tmp/huesteria-results \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg \
       libvulkan1 vulkan-tools \
+      libgl1 libegl1 \
       libgbm1 libnss3 libxss1 libasound2 \
       libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
       libgtk-3-0 libxcomposite1 libxdamage1 libxfixes3 \
@@ -34,7 +37,7 @@ RUN npm init -y >/dev/null 2>&1 \
 
 COPY worker.mjs /opt/huesteria/worker.mjs
 
-# Fail the build if the worker cannot actually boot and answer /health.
+# Build-time smoke test: prove the exact worker process reaches /health.
 RUN set -eux; \
     node --check /opt/huesteria/worker.mjs; \
     HUESTERIA_TOKEN=smoke-token \
@@ -65,4 +68,5 @@ LABEL org.opencontainers.image.title="Huesteria Cloud Renderer" \
 EXPOSE 4000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=12 CMD curl -fsS http://127.0.0.1:4000/health || exit 1
 
+ENTRYPOINT []
 CMD ["node", "/opt/huesteria/worker.mjs"]
